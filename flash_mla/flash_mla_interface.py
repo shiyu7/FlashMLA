@@ -5,6 +5,62 @@ import torch
 
 import flash_mla.cuda as flash_mla_cuda
 
+
+def get_mla_metadata_dense_fp8(
+    cache_seqlens: torch.Tensor,
+    num_q_tokens_per_head_k: int,
+    num_heads_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build scheduling metadata for the SM90 dense FP8 decode kernel."""
+    return flash_mla_cuda.get_mla_metadata_dense_fp8(
+        cache_seqlens,
+        num_q_tokens_per_head_k,
+        num_heads_k,
+    )
+
+
+def flash_mla_dense_fp8(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    causal_seqlens_k: Optional[torch.Tensor] = None,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run SM90 dense FP8 MLA on a local paged KV cache.
+
+    ``causal_seqlens_k[b, q]`` is the exclusive local KV boundary visible to
+    query ``q``. Supplying it enables externally planned cyclic DCP layouts.
+    Returned LSE is natural-log based and covers only this local cache.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if descale_q is None:
+        descale_q = torch.ones(1, dtype=torch.float32, device=q.device)
+    if descale_k is None:
+        descale_k = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    return flash_mla_cuda.dense_decode_fp8_fwd(
+        q,
+        k_cache,
+        head_dim_v,
+        cache_seqlens,
+        block_table,
+        softmax_scale,
+        causal,
+        tile_scheduler_metadata,
+        num_splits,
+        causal_seqlens_k,
+        descale_q,
+        descale_k,
+    )
+
 @dataclasses.dataclass
 class FlashMLASchedMeta:
     """

@@ -20,6 +20,8 @@ def get_features_args():
     features_args = []
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if is_flag_set("FLASH_MLA_DISABLE_FP8"):
+        features_args.append("-DFLASH_MLA_DISABLE_FP8")
     return features_args
 
 def get_arch_flags():
@@ -74,6 +76,11 @@ ext_modules.append(
             "csrc/sm90/decode/dense/instantiations/fp16.cu",
             "csrc/sm90/decode/dense/instantiations/bf16.cu",
 
+            # sm90 dense FP8 decode with rank-local causal boundaries
+            "csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp",
+            "csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu",
+            "csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu",
+
             # sm90 sparse decode
             "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
             "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
@@ -125,6 +132,7 @@ ext_modules.append(
         },
         include_dirs=[
             Path(this_dir) / "csrc",
+            Path(this_dir) / "csrc" / "extension" / "sm90" / "dense_fp8",
             Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
             Path(this_dir) / "csrc" / "sm90",
             Path(this_dir) / "csrc" / "cutlass" / "include",
