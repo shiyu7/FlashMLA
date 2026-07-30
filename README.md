@@ -17,6 +17,8 @@ FlashMLA is DeepSeek's library of optimized attention kernels, powering the [Dee
 - Dense attention for the decoding stage
 - SM90 dense FP8 MLA decoding with external cyclic DCP boundaries
   ([design and validation](docs/dense_fp8_dcp.md))
+- DCP2 single-node peer merge with direct symmetric-buffer output, a fused
+  LSE/output kernel, CUDA-graph-safe device epochs, and NCCL fallback
 
 ## News
 

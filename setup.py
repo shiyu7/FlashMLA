@@ -80,6 +80,7 @@ ext_modules.append(
             "csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp",
             "csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu",
             "csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu",
+            "csrc/extension/sm90/dcp2/dcp2_merge.cu",
 
             # sm90 sparse decode
             "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",

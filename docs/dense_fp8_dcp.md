@@ -70,6 +70,30 @@ The outputs are:
 An empty local shard returns `out = 0` and `local_lse = -inf`, the neutral
 state for cross-rank merging.
 
+### Preallocated output ABI
+
+The DCP2 fast path uses an explicit MQA-only out-variant:
+
+```python
+flash_mla.flash_mla_dense_fp8_out(
+    q,
+    local_k_cache,
+    local_block_table,
+    local_cache_seqlens,
+    512,
+    metadata,
+    num_splits,
+    symmetric_out,       # contiguous [B, Q, H, 512], bfloat16
+    symmetric_lse,       # contiguous [B, Q, H], float32
+    causal=True,
+    causal_seqlens_k=local_causal_seqlens,
+)
+```
+
+Both tensors are written in the kernel's native flattened-query order. No
+post-kernel staging copy is performed. The native `BQH` LSE layout is
+intentionally different from the legacy API's `BHQ` return layout.
+
 ## Cyclic DCP
 
 For cyclic placement, global token `i` belongs to rank `i % cp_size`.
@@ -94,6 +118,59 @@ The merge uses natural exponentials. A runtime whose existing attention state
 uses base-2 LSE must convert this kernel's LSE with `log2(e)` before using its
 base-2 merge.
 
+## DCP2 NVLink fast path
+
+`create_dcp2_attention_workspace` collectively allocates persistent symmetric
+output, LSE, and epoch buffers. The intended call order is:
+
+```python
+workspace = flash_mla.create_dcp2_attention_workspace(
+    max_batch_size,
+    max_q_len,       # <= 8
+    num_heads,       # fixed for this workspace
+    512,
+    dcp_process_group,
+)
+
+local_out, local_lse = workspace.prepare(B, Q, H, 512)
+flash_mla.flash_mla_dense_fp8_out(
+    q, local_k_cache, block_table, local_seqlens, 512,
+    metadata, num_splits, local_out, local_lse,
+    causal=True, causal_seqlens_k=local_causal_seqlens,
+)
+out_head_shard, global_lse_head_shard = workspace.merge(B, Q, H, 512)
+```
+
+`workspace.run_flash_mla_dense_fp8(...)` combines those three calls. Each
+`B x Q x H` row owns a pair of device-side 64-bit counters:
+
+1. `prepare` waits until the row owner consumed the previous producer epoch.
+2. FlashMLA overwrites the symmetric row directly.
+3. The fused kernel publishes both rank-local states, waits for both producer
+   epochs, merges natural-log LSE and BF16 output from peer mappings, and
+   acknowledges consumption.
+
+Only the rank owning that half of the query heads materializes the merged row,
+so the result matches an LSE correction plus output reduce-scatter. Device-side
+epochs increase on every replay; the captured graph does not depend on a
+host-updated buffer index.
+
+The workspace capacity may exceed the active shape, but its first
+`(B, Q, H, Dv)` use locks the compact row geometry. Use a separate workspace
+for each captured graph shape; changing compact strides while an older peer
+epoch may still be consumed is intentionally rejected.
+
+This implementation is deliberately limited to DCP2, a single node with CUDA
+peer access, SM90, and `Q <= 8`. CUDA peer-access validation cannot distinguish
+NVLink from PCIe, so the serving topology policy must reserve the fast path for
+an NVLink pair. DCP4/8 always use `nccl_merge_attention`; they do not extend the
+DCP2 kernel into an all-peer-read algorithm.
+
+`merge_dcp_attention` is the routing helper. It uses the peer workspace only
+for eligible DCP2 shapes and keeps NCCL all-gather plus reduce-scatter as the
+fallback. An optional `max_peer_payload_bytes` may be supplied after measuring
+the target system.
+
 ## Build and validation
 
 On an H100/H800 with CUDA 12.8, disable the SM100 sources:
@@ -102,6 +179,15 @@ On an H100/H800 with CUDA 12.8, disable the SM100 sources:
 FLASH_MLA_DISABLE_SM100=1 pip install -v .
 pytest -q tests/test_dense_fp8_dcp.py
 python benchmark/bench_dense_fp8_dcp.py --cp-sizes 1,2,4,8 --q-len 4
+
+torchrun --standalone --nproc-per-node=2 -m pytest -q \
+    tests/test_dcp2_peer_merge.py
+
+torchrun --standalone --nproc-per-node=2 \
+    benchmark/bench_dcp2_crossover.py \
+    --batches 1,2,4,8,16,32 --q-lens 1,2,4,8 \
+    --heads 32,64,128 --head-dims-v 128,256,512 \
+    --csv dcp2_crossover.csv
 ```
 
 The benchmark simulates ranks sequentially on one GPU. Its `critical_ms`
@@ -109,3 +195,8 @@ metric is the maximum local-kernel time and estimates ideal parallel rank
 execution. It intentionally excludes Q distribution, cross-rank LSE/output
 communication, and process-launch overhead; it reports the local merge cost
 separately.
+
+The two-GPU crossover benchmark times the device-epoch prepare plus fused peer
+merge against the NCCL LSE-all-gather/correction/output-reduce-scatter path. It
+reports every real `(B, Q, H, Dv)` shape and summarizes peer-winning batches
+per exact `(Q, H, Dv)` tuple instead of collapsing the policy to payload bytes.

@@ -5,6 +5,7 @@
 #include "dense_decode.h"
 #include "dense_fwd.h"
 #include "extension/sm90/dense_fp8/dense_fp8_api.h"
+#include "extension/sm90/dcp2/dcp2_merge.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
@@ -14,6 +15,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
     m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
     m.def("dense_decode_fp8_fwd", &fwd_kvcache_mla_fp8);
+    m.def("dense_decode_fp8_fwd_out", &fwd_kvcache_mla_fp8_out);
+    m.def("dcp2_prepare_attention", &dcp2_prepare_attention);
+    m.def("dcp2_merge_attention", &dcp2_merge_attention);
     m.def(
         "get_mla_metadata_dense_fp8",
         &get_mla_decoding_metadata_dense_fp8);

@@ -14,8 +14,10 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+namespace {
+
 std::vector<at::Tensor>
-fwd_kvcache_mla_fp8(
+fwd_kvcache_mla_fp8_impl(
     const at::Tensor &q_input,                   // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor &kcache,                    // num_blocks x page_block_size x num_heads_k x head_size
     const int64_t head_size_v,
@@ -27,7 +29,9 @@ fwd_kvcache_mla_fp8(
     const at::Tensor &num_splits,                // batch_size + 1
     const std::optional<at::Tensor> &causal_seqlens_k, // None or batch_size x seqlen_q
     const std::optional<at::Tensor> &descale_q,  // None or batch_size
-    const std::optional<at::Tensor> &descale_k   // None or batch_size
+    const std::optional<at::Tensor> &descale_k,  // None or batch_size
+    const std::optional<at::Tensor> &out_opt,
+    const std::optional<at::Tensor> &softmax_lse_opt
 ) {
     int head_size_v_int = static_cast<int>(head_size_v);
 
@@ -132,8 +136,62 @@ fwd_kvcache_mla_fp8(
     auto opts = q.options();
     caffe2::TypeMeta out_type;
     out_type = torch::kBFloat16;
-    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v_int}, opts.dtype(out_type));
-    at::Tensor softmax_lse = torch::empty({batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
+    TORCH_CHECK(
+        out_opt.has_value() == softmax_lse_opt.has_value(),
+        "out and softmax_lse must either both be supplied or both be omitted");
+    const bool use_preallocated_output = out_opt.has_value();
+    at::Tensor public_out;
+    at::Tensor public_softmax_lse;
+    at::Tensor out;
+    at::Tensor softmax_lse;
+    if (use_preallocated_output) {
+        // With one KV head the kernel's [B, Q * H, 1, Dv] row order is
+        // exactly the contiguous [B, Q, H, Dv] public order. The same is true
+        // for native LSE [B, 1, Q * H] and public [B, Q, H].
+        TORCH_CHECK(
+            num_heads_k == 1,
+            "preallocated dense FP8 output currently requires MQA "
+            "(num_heads_k == 1)");
+        public_out = out_opt.value();
+        public_softmax_lse = softmax_lse_opt.value();
+        CHECK_DEVICE(public_out);
+        CHECK_DEVICE(public_softmax_lse);
+        TORCH_CHECK(
+            public_out.get_device() == q.get_device() &&
+                public_softmax_lse.get_device() == q.get_device(),
+            "preallocated outputs must be on the same CUDA device as q");
+        TORCH_CHECK(
+            public_out.dtype() == torch::kBFloat16,
+            "out must have dtype bfloat16");
+        TORCH_CHECK(
+            public_softmax_lse.dtype() == torch::kFloat,
+            "softmax_lse must have dtype float32");
+        CHECK_SHAPE(
+            public_out,
+            batch_size,
+            seqlen_q_ori,
+            num_heads_q,
+            head_size_v_int);
+        CHECK_SHAPE(
+            public_softmax_lse,
+            batch_size,
+            seqlen_q_ori,
+            num_heads_q);
+        CHECK_CONTIGUOUS(public_out);
+        CHECK_CONTIGUOUS(public_softmax_lse);
+        out = public_out.view(
+            {batch_size, q_seq_per_hk, num_heads, head_size_v_int});
+        softmax_lse =
+            public_softmax_lse.view({batch_size, num_heads, q_seq_per_hk});
+    } else {
+        out = torch::empty(
+            {batch_size, q_seq_per_hk, num_heads, head_size_v_int},
+            opts.dtype(out_type));
+        softmax_lse = torch::empty(
+            {batch_size, num_heads, q_seq_per_hk},
+            opts.dtype(at::kFloat));
+    }
+    CHECK_CONTIGUOUS(out);
     CHECK_CONTIGUOUS(softmax_lse);
 
     // Set up parameters for the dense FP8 kernel
@@ -212,13 +270,83 @@ fwd_kvcache_mla_fp8(
     run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(params, stream);
 #endif
 
-    // Reshape outputs back to original format
+    if (use_preallocated_output) {
+        return {public_out, public_softmax_lse};
+    }
+
+    // Reshape outputs back to the legacy public format.
     out = out.view({batch_size, seqlen_q_ori, num_q_heads_per_hk, num_heads_k, head_size_v_int}).transpose(2, 3)
             .reshape({batch_size, seqlen_q_ori, num_heads_q, head_size_v_int});
     softmax_lse = softmax_lse.view({batch_size, num_heads_k, seqlen_q_ori, num_q_heads_per_hk}).transpose(2, 3)
             .reshape({batch_size, num_heads_q, seqlen_q_ori});
 
     return {out, softmax_lse};
+}
+
+} // namespace
+
+std::vector<at::Tensor>
+fwd_kvcache_mla_fp8(
+    const at::Tensor &q_input,
+    const at::Tensor &kcache,
+    const int64_t head_size_v,
+    const at::Tensor &seqlens_k,
+    const at::Tensor &block_table,
+    const double softmax_scale,
+    bool is_causal,
+    const at::Tensor &tile_scheduler_metadata,
+    const at::Tensor &num_splits,
+    const std::optional<at::Tensor> &causal_seqlens_k,
+    const std::optional<at::Tensor> &descale_q,
+    const std::optional<at::Tensor> &descale_k) {
+    return fwd_kvcache_mla_fp8_impl(
+        q_input,
+        kcache,
+        head_size_v,
+        seqlens_k,
+        block_table,
+        softmax_scale,
+        is_causal,
+        tile_scheduler_metadata,
+        num_splits,
+        causal_seqlens_k,
+        descale_q,
+        descale_k,
+        std::nullopt,
+        std::nullopt);
+}
+
+std::vector<at::Tensor>
+fwd_kvcache_mla_fp8_out(
+    const at::Tensor &q_input,
+    const at::Tensor &kcache,
+    const int64_t head_size_v,
+    const at::Tensor &seqlens_k,
+    const at::Tensor &block_table,
+    const double softmax_scale,
+    bool is_causal,
+    const at::Tensor &tile_scheduler_metadata,
+    const at::Tensor &num_splits,
+    const std::optional<at::Tensor> &causal_seqlens_k,
+    const std::optional<at::Tensor> &descale_q,
+    const std::optional<at::Tensor> &descale_k,
+    const at::Tensor &out,
+    const at::Tensor &softmax_lse) {
+    return fwd_kvcache_mla_fp8_impl(
+        q_input,
+        kcache,
+        head_size_v,
+        seqlens_k,
+        block_table,
+        softmax_scale,
+        is_causal,
+        tile_scheduler_metadata,
+        num_splits,
+        causal_seqlens_k,
+        descale_q,
+        descale_k,
+        out,
+        softmax_lse);
 }
 
 std::vector<at::Tensor>

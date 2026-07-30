@@ -61,6 +61,59 @@ def flash_mla_dense_fp8(
         descale_k,
     )
 
+
+def flash_mla_dense_fp8_out(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    causal_seqlens_k: Optional[torch.Tensor] = None,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run dense FP8 MLA directly into caller-owned output tensors.
+
+    This allocation-free output ABI is intentionally limited to the MQA
+    layout used by Kimi-K3 (``k_cache.shape[2] == 1``). ``out`` is contiguous
+    ``[B, Q, H, Dv]`` bfloat16 and ``softmax_lse`` is contiguous
+    ``[B, Q, H]`` float32 in the kernel-native order. The latter differs from
+    the legacy ``flash_mla_dense_fp8`` return layout ``[B, H, Q]``.
+
+    Symmetric-memory callers can pass views backed by their persistent
+    allocation; FlashMLA writes those buffers directly and performs no
+    output staging copy.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if descale_q is None:
+        descale_q = torch.ones(1, dtype=torch.float32, device=q.device)
+    if descale_k is None:
+        descale_k = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    return flash_mla_cuda.dense_decode_fp8_fwd_out(
+        q,
+        k_cache,
+        head_dim_v,
+        cache_seqlens,
+        block_table,
+        softmax_scale,
+        causal,
+        tile_scheduler_metadata,
+        num_splits,
+        causal_seqlens_k,
+        descale_q,
+        descale_k,
+        out,
+        softmax_lse,
+    )
+
 @dataclasses.dataclass
 class FlashMLASchedMeta:
     """

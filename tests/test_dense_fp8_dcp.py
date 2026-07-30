@@ -305,3 +305,108 @@ def test_dense_fp8_cyclic_dcp_matches_global_reference(q_len, cp_size):
         atol=0.02,
     )
     torch.testing.assert_close(lse, lse_ref, rtol=0.01, atol=0.02)
+
+
+@torch.inference_mode()
+def test_dense_fp8_preallocated_output_matches_legacy_layout():
+    _require_sm90()
+    torch.manual_seed(319)
+    batch = 2
+    q_len = 4
+    num_heads = 16
+    global_seqlens = torch.tensor(
+        [q_len, 96 + q_len],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    q = (
+        torch.randn(
+            batch,
+            q_len,
+            num_heads,
+            HEAD_DIM,
+            device="cuda",
+        )
+        .mul_(0.1)
+        .clamp_(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    global_kv = (
+        torch.randn(
+            batch,
+            int(global_seqlens.max().item()),
+            NUM_HEADS_K,
+            HEAD_DIM,
+            device="cuda",
+        )
+        .mul_(0.1)
+        .clamp_(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    local_cache, block_table, local_seqlens = _pack_cyclic_local_cache(
+        global_kv,
+        global_seqlens,
+        cp_size=2,
+        cp_rank=0,
+    )
+    local_causal = flash_mla.make_cyclic_local_causal_seqlens(
+        global_seqlens,
+        q_len,
+        cp_size=2,
+        cp_rank=0,
+    )
+    metadata, num_splits = flash_mla.get_mla_metadata_dense_fp8(
+        local_seqlens,
+        q_len * num_heads,
+        NUM_HEADS_K,
+    )
+    descale_q = torch.tensor([0.75], dtype=torch.float32, device="cuda")
+    descale_k = torch.tensor([1.25], dtype=torch.float32, device="cuda")
+    kwargs = dict(
+        softmax_scale=1 / math.sqrt(HEAD_DIM),
+        causal=True,
+        causal_seqlens_k=local_causal,
+        descale_q=descale_q,
+        descale_k=descale_k,
+    )
+
+    legacy_out, legacy_lse = flash_mla.flash_mla_dense_fp8(
+        q,
+        local_cache,
+        block_table,
+        local_seqlens,
+        HEAD_DIM_V,
+        metadata,
+        num_splits,
+        **kwargs,
+    )
+    out = torch.empty_like(legacy_out)
+    native_lse = torch.empty(
+        batch,
+        q_len,
+        num_heads,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    returned_out, returned_lse = flash_mla.flash_mla_dense_fp8_out(
+        q,
+        local_cache,
+        block_table,
+        local_seqlens,
+        HEAD_DIM_V,
+        metadata,
+        num_splits,
+        out,
+        native_lse,
+        **kwargs,
+    )
+
+    assert returned_out.data_ptr() == out.data_ptr()
+    assert returned_lse.data_ptr() == native_lse.data_ptr()
+    torch.testing.assert_close(out, legacy_out, rtol=0, atol=0)
+    torch.testing.assert_close(
+        native_lse.transpose(1, 2),
+        legacy_lse,
+        rtol=0,
+        atol=0,
+    )
