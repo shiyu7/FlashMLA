@@ -59,6 +59,10 @@ struct DecodingParams_fp8 {
     // layouts. The caller owns the global-to-local mapping.
     int* __restrict__ causal_seqlens_k_ptr;
     index_t causal_seqlens_k_batch_stride;
+    // Optional valid query-prefix length for a fixed physical Q dimension.
+    // Shape: [b], int32. Rows whose query index is >= q_lens[batch] are
+    // neutralized by the final split-combine kernel.
+    int* __restrict__ q_lens_ptr;
 
     int* __restrict__ tile_scheduler_metadata_ptr;
     int num_sm_parts;
@@ -67,6 +71,13 @@ struct DecodingParams_fp8 {
     int total_num_splits;
     void* __restrict__ softmax_lseaccum_ptr;
     void* __restrict__ oaccum_ptr;
+
+    // Opt-in R14 path. A positive value means that every scheduler partition
+    // is one fixed-size canonical leaf and the final combine must use the
+    // adjacent balanced tree instead of the regular flat split reduction.
+    // The current fused prototype accepts 2, 4, or 8 leaves per batch.
+    int canonical_num_chunks;
+    bool canonical_return_leaves;
 
     int h_h_k_ratio;
     float* __restrict__ descale_q_ptr = nullptr;
@@ -90,3 +101,16 @@ struct Mla_metadata_params {
     int num_sm_parts;
 };
 void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);
+
+struct Mla_canonical_metadata_params {
+    int *__restrict__ seqlens_k_ptr;
+    int *__restrict__ tile_scheduler_metadata_ptr;
+    int *__restrict__ num_splits_ptr;
+    int batch_size;
+    int block_size_n;
+    int chunk_size;
+    int num_chunks;
+};
+void get_mla_canonical_metadata_func(
+    Mla_canonical_metadata_params &params,
+    cudaStream_t stream);

@@ -1,6 +1,8 @@
-from typing import Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
+
+import flash_mla.cuda as flash_mla_cuda
 
 
 TensorOrInt = Union[torch.Tensor, int]
@@ -45,10 +47,16 @@ def make_cyclic_local_causal_seqlens(
     q_len: int,
     cp_size: int,
     cp_rank: int,
+    q_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Build the rank-local exclusive causal boundary for trailing queries.
 
-    ``global_cache_seqlens`` includes all ``q_len`` trailing query tokens.
+    ``q_len`` is the fixed physical Q dimension. By default,
+    ``global_cache_seqlens`` includes that many trailing query tokens.
+    ``q_lens`` may instead provide a per-request valid prefix length; valid
+    rows are aligned to each request's own trailing query window and padded
+    suffix boundaries are clamped to the final cache boundary.
+
     The result has shape ``[batch, q_len]`` and dtype ``torch.int32``.
     """
     _validate_cp(cp_size, cp_rank)
@@ -56,16 +64,39 @@ def make_cyclic_local_causal_seqlens(
         raise ValueError("global_cache_seqlens must have shape [batch]")
     if q_len <= 0:
         raise ValueError("q_len must be positive")
-    # The caller must ensure every cache length is at least q_len. Avoid a
-    # value-dependent Python check because it would synchronize CUDA.
+    if q_lens is not None:
+        if q_lens.ndim != 1 or q_lens.shape != global_cache_seqlens.shape:
+            raise ValueError("q_lens must have shape [batch]")
+        if q_lens.dtype != torch.int32:
+            raise ValueError("q_lens must have dtype torch.int32")
+        if q_lens.device != global_cache_seqlens.device:
+            raise ValueError(
+                "q_lens and global_cache_seqlens must be on the same device"
+            )
+    # The caller must ensure every cache length covers its corresponding
+    # logical query length and 0 <= q_lens <= q_len. Avoid value-dependent
+    # Python checks because they would synchronize CUDA.
 
-    query_offsets = torch.arange(
-        1 - q_len,
-        1,
+    query_indices = torch.arange(
+        q_len,
         device=global_cache_seqlens.device,
         dtype=global_cache_seqlens.dtype,
     )
-    global_boundaries = global_cache_seqlens[:, None] + query_offsets
+    logical_q_lens = (
+        q_lens
+        if q_lens is not None
+        else torch.full_like(global_cache_seqlens, q_len)
+    )
+    global_boundaries = (
+        global_cache_seqlens[:, None]
+        + query_indices[None, :]
+        + 1
+        - logical_q_lens[:, None]
+    )
+    global_boundaries = torch.minimum(
+        global_boundaries,
+        global_cache_seqlens[:, None],
+    )
     local_boundaries = cyclic_local_length(
         global_boundaries,
         cp_size,
@@ -118,3 +149,27 @@ def merge_local_attention(
     weights = torch.exp(log_weights).permute(0, 1, 3, 2).unsqueeze(-1)
     output = (local_outputs.float() * weights).sum(dim=0)
     return output.to(local_outputs.dtype), global_lse
+
+
+def canonical_merge_pair_out(
+    left_output: torch.Tensor,
+    left_lse: torch.Tensor,
+    right_output: torch.Tensor,
+    right_lse: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply one ordered FP32 edge of the canonical attention merge tree.
+
+    Outputs use ``[B, Q, H, Dv]`` and LSEs use ``[B, H, Q]``. ``output`` and
+    ``lse`` may alias the left state, enabling an in-place owner-side tree.
+    """
+    flash_mla_cuda.canonical_merge_pair_out(
+        left_output,
+        left_lse,
+        right_output,
+        right_lse,
+        output,
+        lse,
+    )
+    return output, lse

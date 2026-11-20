@@ -19,6 +19,24 @@ def get_mla_metadata_dense_fp8(
     )
 
 
+def get_mla_metadata_canonical_dense_fp8(
+    cache_seqlens: torch.Tensor,
+    chunk_size: int,
+    num_chunks: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build CUDA-Graph-safe metadata for the R14 canonical prototype.
+
+    The launch always materializes ``num_chunks`` leaves per batch. Chunks
+    past the current sequence length are emitted as exact neutral states, so
+    ragged lengths do not change the fixed merge tree.
+    """
+    return flash_mla_cuda.get_mla_metadata_canonical_dense_fp8(
+        cache_seqlens,
+        chunk_size,
+        num_chunks,
+    )
+
+
 def flash_mla_dense_fp8(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -30,6 +48,7 @@ def flash_mla_dense_fp8(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     causal_seqlens_k: Optional[torch.Tensor] = None,
+    q_lens: Optional[torch.Tensor] = None,
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -37,6 +56,9 @@ def flash_mla_dense_fp8(
 
     ``causal_seqlens_k[b, q]`` is the exclusive local KV boundary visible to
     query ``q``. Supplying it enables externally planned cyclic DCP layouts.
+    ``q_lens[b]`` optionally marks the valid query prefix for request ``b``
+    when the physical input is padded to a fixed ``Qmax <= 8``. Query rows
+    ``q_lens[b]:Qmax`` return zero output and negative-infinity LSE.
     Returned LSE is natural-log based and covers only this local cache.
     """
     if softmax_scale is None:
@@ -57,8 +79,196 @@ def flash_mla_dense_fp8(
         tile_scheduler_metadata,
         num_splits,
         causal_seqlens_k,
+        q_lens,
         descale_q,
         descale_k,
+    )
+
+
+def flash_mla_dense_fp8_fp32(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    causal_seqlens_k: Optional[torch.Tensor] = None,
+    q_lens: Optional[torch.Tensor] = None,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run SM90 dense FP8 MLA and keep the local output in float32.
+
+    This variant is intended for distributed DCP: callers LSE-merge all
+    rank-local outputs first and cast only the final global output.  It shares
+    the regular API's natural-log float32 LSE layout and does not change Q/KV
+    quantization or local split scheduling.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if descale_q is None:
+        descale_q = torch.ones(1, dtype=torch.float32, device=q.device)
+    if descale_k is None:
+        descale_k = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    return flash_mla_cuda.dense_decode_fp8_fwd_fp32(
+        q,
+        k_cache,
+        head_dim_v,
+        cache_seqlens,
+        block_table,
+        softmax_scale,
+        causal,
+        tile_scheduler_metadata,
+        num_splits,
+        causal_seqlens_k,
+        q_lens,
+        descale_q,
+        descale_k,
+    )
+
+
+def flash_mla_dense_fp8_canonical(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    canonical_num_chunks: int,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    causal_seqlens_k: Optional[torch.Tensor] = None,
+    q_lens: Optional[torch.Tensor] = None,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run the opt-in fused canonical-chunk SM90 dense FP8 prototype.
+
+    Every metadata partition is one FP32 attention leaf. Leaves are combined
+    by a fixed adjacent balanced tree, and the public output remains FP32 for
+    a later distributed canonical merge. ``canonical_num_chunks`` currently
+    supports 2, 4, or 8 and must match the metadata builder.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if descale_q is None:
+        descale_q = torch.ones(1, dtype=torch.float32, device=q.device)
+    if descale_k is None:
+        descale_k = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    return flash_mla_cuda.dense_decode_fp8_fwd_canonical(
+        q,
+        k_cache,
+        head_dim_v,
+        cache_seqlens,
+        block_table,
+        softmax_scale,
+        causal,
+        tile_scheduler_metadata,
+        num_splits,
+        canonical_num_chunks,
+        causal_seqlens_k,
+        q_lens,
+        descale_q,
+        descale_k,
+    )
+
+
+def flash_mla_dense_fp8_canonical_leaves(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    canonical_num_chunks: int,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    causal_seqlens_k: Optional[torch.Tensor] = None,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Export fixed-chunk FP32 leaves without applying a local tree.
+
+    Output shapes are ``[B, chunks, Q, H, Dv]`` and
+    ``[B, chunks, H, Q]``. Distributed callers must restore global chunk-id
+    order before applying the canonical tree. Ragged ``q_lens`` is deferred
+    until the distributed epilogue and is intentionally not accepted here.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if descale_q is None:
+        descale_q = torch.ones(1, dtype=torch.float32, device=q.device)
+    if descale_k is None:
+        descale_k = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    return flash_mla_cuda.dense_decode_fp8_fwd_canonical_leaves(
+        q,
+        k_cache,
+        head_dim_v,
+        cache_seqlens,
+        block_table,
+        softmax_scale,
+        causal,
+        tile_scheduler_metadata,
+        num_splits,
+        canonical_num_chunks,
+        causal_seqlens_k,
+        descale_q,
+        descale_k,
+    )
+
+
+def flash_mla_dense_fp8_canonical_leaves_out(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    canonical_num_chunks: int,
+    out: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    causal_seqlens_k: Optional[torch.Tensor] = None,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Export one MQA FP32 leaf directly into caller-owned output storage.
+
+    ``out`` must be contiguous ``[B, 1, Q, H, Dv]`` float32. The returned LSE
+    keeps the canonical leaf layout ``[B, 1, H, Q]`` and is still allocated by
+    FlashMLA; only the dominant output state uses the direct-write ABI.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if descale_q is None:
+        descale_q = torch.ones(1, dtype=torch.float32, device=q.device)
+    if descale_k is None:
+        descale_k = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    return flash_mla_cuda.dense_decode_fp8_fwd_canonical_leaves_out(
+        q,
+        k_cache,
+        head_dim_v,
+        cache_seqlens,
+        block_table,
+        softmax_scale,
+        causal,
+        tile_scheduler_metadata,
+        num_splits,
+        canonical_num_chunks,
+        causal_seqlens_k,
+        descale_q,
+        descale_k,
+        out,
     )
 
 
@@ -75,6 +285,7 @@ def flash_mla_dense_fp8_out(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     causal_seqlens_k: Optional[torch.Tensor] = None,
+    q_lens: Optional[torch.Tensor] = None,
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -88,7 +299,9 @@ def flash_mla_dense_fp8_out(
 
     Symmetric-memory callers can pass views backed by their persistent
     allocation; FlashMLA writes those buffers directly and performs no
-    output staging copy.
+    output staging copy. When ``q_lens`` is supplied, it has shape ``[B]``
+    and marks a valid prefix within the fixed physical ``Qmax <= 8``. Padded
+    suffix rows are written as ``out = 0`` and ``softmax_lse = -inf``.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -108,6 +321,7 @@ def flash_mla_dense_fp8_out(
         tile_scheduler_metadata,
         num_splits,
         causal_seqlens_k,
+        q_lens,
         descale_q,
         descale_k,
         out,

@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <cstdint>
 #include <limits>
@@ -14,8 +15,14 @@ namespace {
 constexpr int kDCPSize = 2;
 constexpr int kWriteEpoch = 0;
 constexpr int kReadEpoch = 1;
-constexpr int kThreads = 256;
+constexpr int kPrepareThreads = 256;
+constexpr int kMergeThreads = 64;
 constexpr uint32_t kMaxFenceSpins = 100'000'000;
+
+union alignas(16) BFloat16x8 {
+    uint4 packed;
+    __nv_bfloat162 pairs[4];
+};
 
 struct PrepareParams {
     const int64_t* flag_ptrs;
@@ -155,19 +162,48 @@ __global__ void dcp2_merge_attention_kernel(MergeParams params) {
     const int64_t output_offset =
         (bq * heads_per_rank + local_head) * params.head_dim_v;
 
-    const auto* in0 = reinterpret_cast<const __nv_bfloat162*>(
-        params.rank0_out + input_offset);
-    const auto* in1 = reinterpret_cast<const __nv_bfloat162*>(
-        params.rank1_out + input_offset);
-    auto* output = reinterpret_cast<__nv_bfloat162*>(
-        params.merged_out + output_offset);
-    const int pairs = params.head_dim_v / 2;
-    for (int pair = threadIdx.x; pair < pairs; pair += blockDim.x) {
-        const float2 value0 = __bfloat1622float2(in0[pair]);
-        const float2 value1 = __bfloat1622float2(in1[pair]);
-        output[pair] = __floats2bfloat162_rn(
-            weights[0] * value0.x + weights[1] * value1.x,
-            weights[0] * value0.y + weights[1] * value1.y);
+    if (params.head_dim_v % 8 == 0) {
+        const auto* in0 = reinterpret_cast<const BFloat16x8*>(
+            params.rank0_out + input_offset);
+        const auto* in1 = reinterpret_cast<const BFloat16x8*>(
+            params.rank1_out + input_offset);
+        auto* output = reinterpret_cast<BFloat16x8*>(
+            params.merged_out + output_offset);
+        const int vectors = params.head_dim_v / 8;
+        for (int vector = threadIdx.x; vector < vectors;
+             vector += blockDim.x) {
+            BFloat16x8 value0;
+            BFloat16x8 value1;
+            BFloat16x8 result;
+            value0.packed = in0[vector].packed;
+            value1.packed = in1[vector].packed;
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const float2 pair0 =
+                    __bfloat1622float2(value0.pairs[pair]);
+                const float2 pair1 =
+                    __bfloat1622float2(value1.pairs[pair]);
+                result.pairs[pair] = __floats2bfloat162_rn(
+                    weights[0] * pair0.x + weights[1] * pair1.x,
+                    weights[0] * pair0.y + weights[1] * pair1.y);
+            }
+            output[vector].packed = result.packed;
+        }
+    } else {
+        const auto* in0 = reinterpret_cast<const __nv_bfloat162*>(
+            params.rank0_out + input_offset);
+        const auto* in1 = reinterpret_cast<const __nv_bfloat162*>(
+            params.rank1_out + input_offset);
+        auto* output = reinterpret_cast<__nv_bfloat162*>(
+            params.merged_out + output_offset);
+        const int pairs = params.head_dim_v / 2;
+        for (int pair = threadIdx.x; pair < pairs; pair += blockDim.x) {
+            const float2 value0 = __bfloat1622float2(in0[pair]);
+            const float2 value1 = __bfloat1622float2(in1[pair]);
+            output[pair] = __floats2bfloat162_rn(
+                weights[0] * value0.x + weights[1] * value1.x,
+                weights[0] * value0.y + weights[1] * value1.y);
+        }
     }
     if (threadIdx.x == 0) {
         params.merged_lse[bq * heads_per_rank + local_head] = global_lse;
@@ -227,7 +263,8 @@ void dcp2_prepare_attention(
     check_sm90();
     check_common_geometry(batch_size, seqlen_q, num_heads, dcp_rank);
     const int64_t rows = batch_size * seqlen_q * num_heads;
-    const int blocks = static_cast<int>((rows + kThreads - 1) / kThreads);
+    const int blocks =
+        static_cast<int>((rows + kPrepareThreads - 1) / kPrepareThreads);
     const PrepareParams params{
         flag_ptrs.data_ptr<int64_t>(),
         rows,
@@ -236,7 +273,7 @@ void dcp2_prepare_attention(
     };
     dcp2_prepare_attention_kernel<<<
         blocks,
-        kThreads,
+        kPrepareThreads,
         0,
         at::cuda::getCurrentCUDAStream().stream()>>>(params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -341,7 +378,7 @@ void dcp2_merge_attention(
     };
     dcp2_merge_attention_kernel<<<
         static_cast<int>(rows),
-        kThreads,
+        kMergeThreads,
         0,
         at::cuda::getCurrentCUDAStream().stream()>>>(params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();

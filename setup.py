@@ -80,6 +80,9 @@ ext_modules.append(
             "csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp",
             "csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu",
             "csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu",
+            "csrc/extension/sm90/dense_fp8/canonical_merge.cu",
+            "csrc/extension/sm90/dense_fp8/canonical_peer_kv_pack.cu",
+            "csrc/extension/sm90/dense_fp8/canonical_peer_reduce_scatter.cu",
             "csrc/extension/sm90/dcp2/dcp2_merge.cu",
 
             # sm90 sparse decode
@@ -138,6 +141,7 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "sm90",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+            Path(CUDA_HOME) / "include" / "cccl",  # CUDA 13 libcudacxx layout
         ],
     )
 )

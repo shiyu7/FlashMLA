@@ -43,6 +43,7 @@ out, local_lse = flash_mla.flash_mla_dense_fp8(
     softmax_scale=576**-0.5,
     causal=True,
     causal_seqlens_k=local_causal_seqlens,
+    q_lens=q_lens,
     descale_q=descale_q,
     descale_k=descale_k,
 )
@@ -55,12 +56,29 @@ out, local_lse = flash_mla.flash_mla_dense_fp8(
 | `local_block_table` | `[B, max_local_pages]` | int32 local page IDs |
 | `local_cache_seqlens` | `[B]` | int32 number of local KV tokens |
 | `causal_seqlens_k` | optional `[B, Q]` | int32 exclusive local KV boundary for each query |
+| `q_lens` | optional `[B]` | contiguous CUDA int32 valid-query prefix length inside fixed physical `Qmax <= 8` |
 | `descale_q`, `descale_k` | `[1]` | float32 quantization descales |
 
 `causal_seqlens_k` must be nondecreasing along the query dimension and each
 entry must be between zero and the corresponding `local_cache_seqlens`.
 When it is supplied, causal masking is enabled even for `Q == 1`. This is
 necessary for ranks that do not own the newest global token.
+
+For continuous batching, callers may keep `q` physically rectangular as
+`[B, Qmax, Hq, 576]` and pass `q_lens[b]` for the logical query count of
+each request. Only the prefix `q[b, :q_lens[b]]` is valid. FlashMLA writes
+the padded suffix directly as `out = 0` and `lse = -inf`; it does not
+overload `causal_seqlens_k` as a query-validity mask. The current
+first-version contract requires `0 <= q_lens[b] <= Qmax <= 8`.
+The attention kernel still schedules the physical `Qmax`; `q_lens` only
+guarantees correct neutral outputs for padding in this first version.
+It is a separate validity input: callers must still pass
+`causal_seqlens_k` when per-query causal KV boundaries are required.
+
+For cyclic DCP, pass the same tensor to
+`make_cyclic_local_causal_seqlens(..., q_lens=q_lens)`. This aligns each
+request's valid prefix with its own trailing query window instead of
+deriving every request from the physical `Qmax`.
 
 The outputs are:
 
@@ -87,12 +105,16 @@ flash_mla.flash_mla_dense_fp8_out(
     symmetric_lse,       # contiguous [B, Q, H], float32
     causal=True,
     causal_seqlens_k=local_causal_seqlens,
+    q_lens=q_lens,
 )
 ```
 
 Both tensors are written in the kernel's native flattened-query order. No
 post-kernel staging copy is performed. The native `BQH` LSE layout is
 intentionally different from the legacy API's `BHQ` return layout.
+`q_lens` has the same `[B]` valid-prefix contract as the allocating API; the
+out-variant writes every padded suffix row directly as zero output and
+negative-infinity LSE.
 
 ## Cyclic DCP
 
@@ -105,7 +127,11 @@ local_cache_seqlens = flash_mla.cyclic_local_length(
 ).to(torch.int32)
 
 local_causal_seqlens = flash_mla.make_cyclic_local_causal_seqlens(
-    global_cache_seqlens, q_len, cp_size, cp_rank
+    global_cache_seqlens,
+    q_len,
+    cp_size,
+    cp_rank,
+    q_lens=q_lens,
 )
 
 global_out, global_lse = flash_mla.merge_local_attention(
@@ -137,12 +163,37 @@ flash_mla.flash_mla_dense_fp8_out(
     q, local_k_cache, block_table, local_seqlens, 512,
     metadata, num_splits, local_out, local_lse,
     causal=True, causal_seqlens_k=local_causal_seqlens,
+    q_lens=q_lens,
 )
 out_head_shard, global_lse_head_shard = workspace.merge(B, Q, H, 512)
 ```
 
-`workspace.run_flash_mla_dense_fp8(...)` combines those three calls. Each
-`B x Q x H` row owns a pair of device-side 64-bit counters:
+`workspace.run_flash_mla_dense_fp8(...)` combines those three calls and
+forwards `q_lens` unchanged to the out-variant:
+
+```python
+out_head_shard, global_lse_head_shard = (
+    workspace.run_flash_mla_dense_fp8(
+        q,
+        local_k_cache,
+        block_table,
+        local_seqlens,
+        512,
+        metadata,
+        num_splits,
+        causal=True,
+        causal_seqlens_k=local_causal_seqlens,
+        q_lens=q_lens,
+        descale_q=descale_q,
+        descale_k=descale_k,
+    )
+)
+```
+
+The physical `Q` remains part of the workspace's fixed graph shape while the
+values in `q_lens` may change between graph replays, provided the tensor
+storage and shape remain stable and `causal_seqlens_k` is updated to match.
+Each `B x Q x H` row owns a pair of device-side 64-bit counters:
 
 1. `prepare` waits until the row owner consumed the previous producer epoch.
 2. FlashMLA overwrites the symmetric row directly.

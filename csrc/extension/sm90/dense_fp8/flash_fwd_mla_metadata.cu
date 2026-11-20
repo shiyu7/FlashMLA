@@ -75,3 +75,55 @@ void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream) {
     get_mla_metadata_kernel<<<1, 32, 0, stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
+
+// Build one scheduler record per canonical chunk. The grid shape is fixed by
+// num_chunks, while the current sequence length is read on device so the
+// metadata update remains CUDA-Graph friendly and introduces no host sync.
+__global__ void __launch_bounds__(256, 1, 1)
+get_mla_canonical_metadata_kernel(
+    __grid_constant__ const Mla_canonical_metadata_params params) {
+    const int partition = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_partitions = params.batch_size * params.num_chunks;
+    if (partition < total_partitions) {
+        const int batch_idx = partition / params.num_chunks;
+        const int chunk_idx = partition - batch_idx * params.num_chunks;
+        const int seqlen = max(__ldg(params.seqlens_k_ptr + batch_idx), 0);
+        const int chunk_begin = chunk_idx * params.chunk_size;
+        const int chunk_end = min(chunk_begin + params.chunk_size, seqlen);
+
+        // For an inactive tail leaf use the first block boundary after the
+        // sequence. This makes n_block_min == n_block_max even when seqlen is
+        // not page aligned, and the attention kernel emits a neutral state.
+        const int empty_boundary =
+            cutlass::ceil_div(seqlen, params.block_size_n) * params.block_size_n;
+        const bool active = chunk_begin < chunk_end;
+        int *metadata =
+            params.tile_scheduler_metadata_ptr
+            + partition * TileSchedulerMetaDataSize;
+        metadata[0] = batch_idx;
+        metadata[1] = active ? chunk_begin : empty_boundary;
+        metadata[2] = batch_idx;
+        metadata[3] = active ? chunk_end : empty_boundary;
+        metadata[4] = chunk_idx;
+        metadata[5] = 0;
+        metadata[6] = 0;
+        metadata[7] = 0;
+    }
+
+    if (blockIdx.x == 0) {
+        for (int batch_idx = threadIdx.x; batch_idx <= params.batch_size;
+             batch_idx += blockDim.x) {
+            params.num_splits_ptr[batch_idx] =
+                batch_idx * params.num_chunks;
+        }
+    }
+}
+
+void get_mla_canonical_metadata_func(
+    Mla_canonical_metadata_params &params,
+    cudaStream_t stream) {
+    const int total_partitions = params.batch_size * params.num_chunks;
+    get_mla_canonical_metadata_kernel<<<
+        cutlass::ceil_div(total_partitions, 128), 128, 0, stream>>>(params);
+    CHECK_CUDA_KERNEL_LAUNCH();
+}

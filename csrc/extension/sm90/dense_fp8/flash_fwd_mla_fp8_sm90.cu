@@ -7,4 +7,5 @@
 
 #ifndef FLASH_MLA_DISABLE_FP8
 template void run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(DecodingParams_fp8 &params, cudaStream_t stream);
+template void run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, float, 576>(DecodingParams_fp8 &params, cudaStream_t stream);
 #endif

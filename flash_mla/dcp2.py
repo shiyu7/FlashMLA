@@ -336,6 +336,7 @@ class DCP2AttentionWorkspace:
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         causal_seqlens_k: Optional[torch.Tensor] = None,
+        q_lens: Optional[torch.Tensor] = None,
         descale_q: Optional[torch.Tensor] = None,
         descale_k: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
@@ -359,6 +360,7 @@ class DCP2AttentionWorkspace:
             softmax_scale=softmax_scale,
             causal=causal,
             causal_seqlens_k=causal_seqlens_k,
+            q_lens=q_lens,
             descale_q=descale_q,
             descale_k=descale_k,
         )

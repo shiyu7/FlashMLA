@@ -205,13 +205,18 @@ __forceinline__ __device__ void store(const DecodingParams_fp8 &params, const in
 
     const int split_offset = __ldg(params.num_splits_ptr + bidb);
 
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(tOrO, scale_softmax, descale_k);
+    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(
+        tOrO, scale_softmax, descale_k);
 
     using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(shared_storage.smem_o.data())), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
     // Partition sO to match the accumulator partitioning
+    // SM90_U32x4_STSM_N is the fast 16-bit output path.  A float output has
+    // the same representation as the split accumulator path and must use the
+    // generic 128-bit copy atom; STSM_N cannot vectorize the 32-bit register
+    // fragment into this shared-memory layout.
     using SmemTiledCopyO = std::conditional_t<
-            !Split,
+            !Split && !cute::is_same_v<Element, ElementAccum>,
             typename Kernel_traits::SmemCopyAtomO,
             typename Kernel_traits::SmemCopyAtomOaccum
     >;
@@ -421,7 +426,6 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
 
             if constexpr (Kernel_traits::Is_FP8) {
                 cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::TransVReady));
-                __syncthreads();
             }
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
 
@@ -549,7 +553,6 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
 
             flash::rescale_o(tOrO, scale_o);
 
-            if constexpr (Kernel_traits::Is_FP8) __syncthreads();
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
 
             if constexpr (!Kernel_traits::Is_FP8) {
@@ -570,7 +573,62 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
         store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, descale_k, scale_softmax);
 }
 
-template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
+template<typename Kernel_traits>
+__forceinline__ __device__ void store_neutral_attention_state(
+    const DecodingParams_fp8 &params,
+    const int batch_id,
+    const int bidh,
+    const int m_block,
+    const int n_split_idx,
+    const bool split_output) {
+    using ElementO = typename Kernel_traits::ElementO;
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
+    const int row_begin = m_block * kBlockM;
+    const int num_rows = min(kBlockM, params.q_seq_per_hk - row_begin);
+
+    if (split_output) {
+        const int split_offset = __ldg(params.num_splits_ptr + batch_id);
+        const int split_idx = split_offset + n_split_idx;
+        float *out_ptr =
+            reinterpret_cast<float *>(params.oaccum_ptr)
+            + (((split_idx * params.h_k + bidh) * params.q_seq_per_hk
+                + row_begin) * kHeadDimV);
+        for (int idx = threadIdx.x; idx < num_rows * kHeadDimV;
+             idx += blockDim.x) {
+            out_ptr[idx] = 0.f;
+        }
+        float *lse_ptr =
+            reinterpret_cast<float *>(params.softmax_lseaccum_ptr)
+            + (split_idx * params.h_k + bidh) * params.q_seq_per_hk
+            + row_begin;
+        for (int row = threadIdx.x; row < num_rows; row += blockDim.x) {
+            lse_ptr[row] = -INFINITY;
+        }
+        return;
+    }
+
+    ElementO *out_ptr =
+        reinterpret_cast<ElementO *>(params.o_ptr)
+        + batch_id * params.o_batch_stride
+        + bidh * params.o_head_stride
+        + row_begin * params.o_row_stride;
+    for (int idx = threadIdx.x; idx < num_rows * kHeadDimV;
+         idx += blockDim.x) {
+        const int row = idx / kHeadDimV;
+        const int col = idx % kHeadDimV;
+        out_ptr[row * params.o_row_stride + col] = ElementO(0);
+    }
+    float *lse_ptr =
+        reinterpret_cast<float *>(params.softmax_lse_ptr)
+        + (batch_id * params.h_k + bidh) * params.q_seq_per_hk
+        + row_begin;
+    for (int row = threadIdx.x; row < num_rows; row += blockDim.x) {
+        lse_ptr[row] = -INFINITY;
+    }
+}
+
+template<typename Kernel_traits, bool Is_causal, typename SharedStorage, bool UsePdl>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
 flash_fwd_splitkv_mla_kernel(__grid_constant__ const DecodingParams_fp8 params) {
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -587,7 +645,12 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DecodingParams_fp8 params) 
     int begin_seqlen = tile_scheduler_metadata.y;
     int end_idx = tile_scheduler_metadata.z;
     int end_seqlen = tile_scheduler_metadata.w;
-    if (begin_idx >= params.b || begin_idx < 0) return;
+    if (begin_idx >= params.b || begin_idx < 0) {
+        if constexpr (UsePdl) {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+        return;
+    }
     int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
 
     float descale_k = 1.f;
@@ -606,37 +669,32 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DecodingParams_fp8 params) 
         const int seqlen_k = __ldg(params.seqlens_k_ptr + batch_id);
         const int n_block_min = batch_id == begin_idx ? begin_seqlen / kBlockN : 0;
         const int n_block_max = batch_id == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : cute::ceil_div(seqlen_k, kBlockN);
-        const bool NoSplit = n_block_min == 0 && n_block_max == cute::ceil_div(seqlen_k, kBlockN);
+        const bool NoSplit =
+            params.canonical_num_chunks == 0 && n_block_min == 0 &&
+            n_block_max == cute::ceil_div(seqlen_k, kBlockN);
         if (batch_id > begin_idx) {
             __syncthreads();  // Barrier between two tiles.
         }
-        if (seqlen_k == 0) {
+        if constexpr (UsePdl) {
+            if (batch_id == end_idx) {
+            // The dependent combine grid may now run its address-generation
+            // prologue. Its grid-dependency wait remains ahead of every load
+            // from the accumulators written below.
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+        if (seqlen_k == 0 || n_block_min >= n_block_max) {
             // Empty cyclic shards occur for short requests when cp_size is
-            // larger than the global prefix. Do not touch block_table[-1].
-            // Emit the neutral state consumed by a cross-rank LSE merge.
-            using ElementO = typename Kernel_traits::ElementO;
-            constexpr int kBlockM = Kernel_traits::kBlockM;
-            constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
-            const int row_begin = m_block * kBlockM;
-            const int num_rows = min(kBlockM, params.q_seq_per_hk - row_begin);
-            ElementO* out_ptr =
-                reinterpret_cast<ElementO*>(params.o_ptr)
-                + batch_id * params.o_batch_stride
-                + bidh * params.o_head_stride
-                + row_begin * params.o_row_stride;
-            for (int idx = threadIdx.x; idx < num_rows * kHeadDimV;
-                 idx += blockDim.x) {
-                const int row = idx / kHeadDimV;
-                const int col = idx % kHeadDimV;
-                out_ptr[row * params.o_row_stride + col] = ElementO(0);
-            }
-            float* lse_ptr =
-                reinterpret_cast<float*>(params.softmax_lse_ptr)
-                + (batch_id * params.h_k + bidh) * params.q_seq_per_hk
-                + row_begin;
-            for (int row = threadIdx.x; row < num_rows; row += blockDim.x) {
-                lse_ptr[row] = -INFINITY;
-            }
+            // larger than the global prefix, and inactive canonical tail
+            // chunks are represented by an empty block interval. Do not
+            // touch block_table[-1]; emit the exact neutral state instead.
+            store_neutral_attention_state<Kernel_traits>(
+                params,
+                batch_id,
+                bidh,
+                m_block,
+                n_split_idx,
+                params.canonical_num_chunks > 0);
             continue;
         }
         flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit, shared_storage, descale_k, scale_softmax, scale_softmax_log2);
@@ -645,9 +703,12 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DecodingParams_fp8 params) 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Keep the original 128-thread row mapping for small launches.  It exposes
+// four output elements per thread and is faster when there are too few rows
+// to amortize the longer per-thread accumulation of the warp-grouped kernel.
 template<typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits>
 __global__ void __launch_bounds__(256, 1, 1)
-flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const DecodingParams_fp8 params) {
+flash_fwd_splitkv_mla_combine_128_kernel(__grid_constant__ const DecodingParams_fp8 params) {
     constexpr int kNThreads = 128;
 
     const int tidx = threadIdx.x;
@@ -655,6 +716,32 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const DecodingParams_fp8 
     const int hs = params.h_k * params.q_seq_per_hk;
     const int batch_idx = bidx / hs;
     const int hs_idx = bidx % hs;
+    const int head_idx = hs_idx / params.q_seq_per_hk;
+    const int row = hs_idx - head_idx * params.q_seq_per_hk;
+
+    static_assert(kHeadDimV % kNThreads == 0);
+    constexpr int Elements = kHeadDimV / kNThreads;
+    if (params.q_lens_ptr != nullptr) {
+        const int query_idx = row / params.q_head_per_hk;
+        const int q_len = __ldg(params.q_lens_ptr + batch_idx);
+        FLASH_DEVICE_ASSERT(q_len >= 0 && q_len <= params.s_q);
+        if (query_idx >= q_len) {
+            if (tidx == 0) {
+                reinterpret_cast<ElementAccum*>(
+                    params.softmax_lse_ptr)[bidx] = -INFINITY;
+            }
+            auto o_ptr =
+                reinterpret_cast<Element*>(params.o_ptr)
+                + batch_idx * params.o_batch_stride
+                + head_idx * params.o_head_stride
+                + row * params.o_row_stride;
+#pragma unroll
+            for (int i = 0; i < Elements; ++i) {
+                o_ptr[tidx * Elements + i] = Element(0);
+            }
+            return;
+        }
+    }
 
     const int split_offset = __ldg(params.num_splits_ptr + batch_idx);
     const int actual_num_splits = __ldg(params.num_splits_ptr + batch_idx + 1) - split_offset;
@@ -683,15 +770,14 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const DecodingParams_fp8 
         float max_lse = -INFINITY;
         for (int i = 0; i < kNLsePerThread; ++i) max_lse = max(max_lse, local_lse[i]);
         for (int offset = 16; offset >= 1; offset /= 2) max_lse = max(max_lse, __shfl_xor_sync(uint32_t(-1), max_lse, offset));
-        max_lse = max_lse == -INFINITY ? 0.0f : max_lse;  // In case all local LSEs are -inf
+        max_lse = max_lse == -INFINITY ? 0.0f : max_lse;
 
         float sum_lse = 0;
         for (int i = 0; i < kNLsePerThread; ++i) sum_lse = sum_lse + expf(local_lse[i] - max_lse);
         for (int offset = 16; offset >= 1; offset /= 2) sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
 
         const bool has_attendable_key = sum_lse > 0.f && sum_lse == sum_lse;
-        float global_lse =
-            has_attendable_key ? logf(sum_lse) + max_lse : -INFINITY;
+        float global_lse = has_attendable_key ? logf(sum_lse) + max_lse : -INFINITY;
         if (tidx == 0) gLSE(0) = global_lse;
 
         for (int i = 0; i < kNLsePerThread; ++i) {
@@ -706,8 +792,6 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const DecodingParams_fp8 
     }
     __syncthreads();
 
-    static_assert(kHeadDimV % kNThreads == 0);
-    constexpr int Elements = kHeadDimV / kNThreads;
     const index_t row_offset_oaccum = (split_offset * hs + hs_idx) * kHeadDimV;
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
                                  Shape<Int<kHeadDimV>>{}, Stride<_1>{});
@@ -732,11 +816,362 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const DecodingParams_fp8 
     }
 
     Tensor rO = flash::convert_type<Element>(tOrO);
-    const int head_idx = (bidx - batch_idx * hs) / params.q_seq_per_hk;
-    const int row = bidx - batch_idx * hs - head_idx * params.q_seq_per_hk;
     auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride + head_idx * params.o_head_stride + row * params.o_row_stride;
     Tensor gO = make_tensor(make_gmem_ptr(o_ptr + tidx * Elements), Shape<Int<decltype(size<0>(rO))::value>>{}, Stride<_1>{});
     cute::copy(rO, gO);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits, int kRowsPerBlock>
+__global__ void __launch_bounds__(kRowsPerBlock * 32, 1, 1)
+flash_fwd_splitkv_mla_combine_warp_grouped_kernel(__grid_constant__ const DecodingParams_fp8 params) {
+    constexpr int kWarpSize = 32;
+    constexpr int kVectorSize = 4;
+    static_assert(kRowsPerBlock > 0);
+    static_assert(kRowsPerBlock <= 8);
+    static_assert(kHeadDimV % (kWarpSize * kVectorSize) == 0);
+
+    const int tidx = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int hs = params.h_k * params.q_seq_per_hk;
+    const int blocks_per_batch = cute::ceil_div(hs, kRowsPerBlock);
+    const int batch_idx = bidx / blocks_per_batch;
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
+    const int lane_idx = tidx % kWarpSize;
+    const int hs_idx = (bidx - batch_idx * blocks_per_batch) * kRowsPerBlock + warp_idx;
+    if (hs_idx >= hs) return;
+    const int head_idx = hs_idx / params.q_seq_per_hk;
+    const int row = hs_idx - head_idx * params.q_seq_per_hk;
+
+    // See the 128-thread fallback above: ragged rows also write final output,
+    // so they must not bypass the producer dependency.
+    cudaGridDependencySynchronize();
+
+    if (params.q_lens_ptr != nullptr) {
+        const int query_idx = row / params.q_head_per_hk;
+        const int q_len = __ldg(params.q_lens_ptr + batch_idx);
+        FLASH_DEVICE_ASSERT(q_len >= 0 && q_len <= params.s_q);
+        if (query_idx >= q_len) {
+            if (lane_idx == 0) {
+                reinterpret_cast<ElementAccum*>(
+                    params.softmax_lse_ptr)[batch_idx * hs + hs_idx] = -INFINITY;
+            }
+            auto o_ptr =
+                reinterpret_cast<Element*>(params.o_ptr)
+                + batch_idx * params.o_batch_stride
+                + head_idx * params.o_head_stride
+                + row * params.o_row_stride;
+#pragma unroll
+            for (int i = 0; i < kHeadDimV / (kWarpSize * kVectorSize); ++i) {
+                cutlass::Array<Element, kVectorSize> zeros;
+                zeros.clear();
+                *reinterpret_cast<cutlass::Array<Element, kVectorSize> *>(
+                    o_ptr + lane_idx * kVectorSize + i * kWarpSize * kVectorSize) = zeros;
+            }
+            return;
+        }
+    }
+
+    const int split_offset = __ldg(params.num_splits_ptr + batch_idx);
+    const int actual_num_splits = __ldg(params.num_splits_ptr + batch_idx + 1) - split_offset;
+    FLASH_DEVICE_ASSERT(actual_num_splits <= kMaxSplits);
+    if (actual_num_splits <= 1) return;
+
+    __shared__ ElementAccum sLseScale[kRowsPerBlock][kMaxSplits];
+
+    const index_t row_offset_oaccum = (split_offset * hs + hs_idx) * kHeadDimV;
+    const index_t oaccum_split_stride = hs * kHeadDimV;
+    const ElementAccum *oaccum_ptr =
+        reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum;
+    constexpr int kVectorsPerThread = kHeadDimV / (kWarpSize * kVectorSize);
+    cutlass::Array<float4, kVectorsPerThread> prefetched_oaccum;
+#pragma unroll
+    for (int i = 0; i < kVectorsPerThread; ++i) {
+        prefetched_oaccum[i] = *reinterpret_cast<const float4 *>(
+            oaccum_ptr + lane_idx * kVectorSize + i * kWarpSize * kVectorSize);
+    }
+
+    const index_t row_offset_lseaccum = split_offset * hs + hs_idx;
+    const index_t row_offset_lse = batch_idx * hs + hs_idx;
+    Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
+                                   Shape<Int<kMaxSplits>>{}, make_stride(hs));
+    Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
+                              Shape<_1>{}, Stride<_1>{});
+
+    constexpr int kNLsePerThread = cute::ceil_div(kMaxSplits, kWarpSize);
+
+    float local_lse[kNLsePerThread];
+#pragma unroll
+    for (int i = 0; i < kNLsePerThread; ++i) {
+        const int split = i * kWarpSize + lane_idx;
+        local_lse[i] = split < actual_num_splits ? gLSEaccum(split) : -INFINITY;
+    }
+
+    float max_lse = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < kNLsePerThread; ++i) max_lse = max(max_lse, local_lse[i]);
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) max_lse = max(max_lse, __shfl_xor_sync(uint32_t(-1), max_lse, offset));
+    max_lse = max_lse == -INFINITY ? 0.0f : max_lse;  // In case all local LSEs are -inf
+
+    float sum_lse = 0;
+#pragma unroll
+    for (int i = 0; i < kNLsePerThread; ++i) sum_lse = sum_lse + expf(local_lse[i] - max_lse);
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
+
+    const bool has_attendable_key = sum_lse > 0.f && sum_lse == sum_lse;
+    float global_lse = has_attendable_key ? logf(sum_lse) + max_lse : -INFINITY;
+    if (lane_idx == 0) gLSE(0) = global_lse;
+
+#pragma unroll
+    for (int i = 0; i < kNLsePerThread; ++i) {
+        const int split = i * kWarpSize + lane_idx;
+        if (split < actual_num_splits) {
+            sLseScale[warp_idx][split] =
+                has_attendable_key
+                    ? expf(local_lse[i] - global_lse)
+                    : 0.f;
+        }
+    }
+    __syncwarp();
+
+    cutlass::Array<float4, kVectorsPerThread> result;
+    result.clear();
+
+    for (int split = 0; split < actual_num_splits; ++split) {
+        const ElementAccum lse_scale = sLseScale[warp_idx][split];
+#pragma unroll
+        for (int i = 0; i < kVectorsPerThread; ++i) {
+            const float4 data = prefetched_oaccum[i];
+            result[i].x += lse_scale * data.x;
+            result[i].y += lse_scale * data.y;
+            result[i].z += lse_scale * data.z;
+            result[i].w += lse_scale * data.w;
+            if (split + 1 < actual_num_splits) {
+                prefetched_oaccum[i] = *reinterpret_cast<const float4 *>(
+                    oaccum_ptr + (split + 1) * oaccum_split_stride
+                    + lane_idx * kVectorSize + i * kWarpSize * kVectorSize);
+            }
+        }
+    }
+
+    auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride + head_idx * params.o_head_stride + row * params.o_row_stride;
+#pragma unroll
+    for (int i = 0; i < kVectorsPerThread; ++i) {
+        cutlass::Array<Element, kVectorSize> converted;
+        converted[0] = Element(result[i].x);
+        converted[1] = Element(result[i].y);
+        converted[2] = Element(result[i].z);
+        converted[3] = Element(result[i].w);
+        *reinterpret_cast<cutlass::Array<Element, kVectorSize> *>(
+            o_ptr + lane_idx * kVectorSize + i * kWarpSize * kVectorSize) = converted;
+    }
+}
+
+__forceinline__ __device__ float canonical_merge_lse(
+    const float left,
+    const float right,
+    float &left_weight,
+    float &right_weight) {
+    if (left == -INFINITY && right == -INFINITY) {
+        left_weight = 0.f;
+        right_weight = 0.f;
+        return -INFINITY;
+    }
+    const float max_lse = max(left, right);
+    const float sum = expf(left - max_lse) + expf(right - max_lse);
+    const float merged = logf(sum) + max_lse;
+    left_weight = left == -INFINITY ? 0.f : expf(left - merged);
+    right_weight = right == -INFINITY ? 0.f : expf(right - merged);
+    return merged;
+}
+
+__forceinline__ __device__ float4 canonical_merge_float4(
+    const float4 left,
+    const float4 right,
+    const float left_weight,
+    const float right_weight) {
+    return make_float4(
+        left_weight * left.x + right_weight * right.x,
+        left_weight * left.y + right_weight * right.y,
+        left_weight * left.z + right_weight * right.z,
+        left_weight * left.w + right_weight * right.w);
+}
+
+// R14-P1 fixed-tree epilogue. One warp owns one output row. Lane zero builds
+// the exact adjacent balanced LSE tree in shared memory; every lane then uses
+// the same per-node weights to merge its float4 output fragments in the same
+// tree. Inactive leaves carry (0, -inf), so a fixed 8-leaf launch also handles
+// ragged sequences without changing the arithmetic graph.
+template<typename Element, typename index_t, int kHeadDimV, int kRowsPerBlock>
+__global__ void __launch_bounds__(kRowsPerBlock * 32, 1, 1)
+flash_fwd_splitkv_mla_canonical_combine_kernel(
+    __grid_constant__ const DecodingParams_fp8 params) {
+    constexpr int kWarpSize = 32;
+    constexpr int kVectorSize = 4;
+    constexpr int kMaxChunks = 8;
+    constexpr int kMaxInternalNodes = kMaxChunks - 1;
+    static_assert(kHeadDimV % (kWarpSize * kVectorSize) == 0);
+
+    const int tidx = threadIdx.x;
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
+    const int lane_idx = tidx % kWarpSize;
+    const int hs = params.h_k * params.q_seq_per_hk;
+    const int blocks_per_batch = cute::ceil_div(hs, kRowsPerBlock);
+    const int batch_idx = blockIdx.x / blocks_per_batch;
+    const int hs_idx =
+        (blockIdx.x - batch_idx * blocks_per_batch) * kRowsPerBlock
+        + warp_idx;
+    if (hs_idx >= hs) return;
+    const int head_idx = hs_idx / params.q_seq_per_hk;
+    const int row = hs_idx - head_idx * params.q_seq_per_hk;
+
+    cudaGridDependencySynchronize();
+
+    auto output_ptr =
+        reinterpret_cast<Element *>(params.o_ptr)
+        + batch_idx * params.o_batch_stride
+        + head_idx * params.o_head_stride
+        + row * params.o_row_stride;
+    if (params.q_lens_ptr != nullptr) {
+        const int query_idx = row / params.q_head_per_hk;
+        const int q_len = __ldg(params.q_lens_ptr + batch_idx);
+        FLASH_DEVICE_ASSERT(q_len >= 0 && q_len <= params.s_q);
+        if (query_idx >= q_len) {
+            if (lane_idx == 0) {
+                reinterpret_cast<float *>(params.softmax_lse_ptr)[
+                    batch_idx * hs + hs_idx] = -INFINITY;
+            }
+#pragma unroll
+            for (int vector = 0;
+                 vector < kHeadDimV / (kWarpSize * kVectorSize);
+                 ++vector) {
+                cutlass::Array<Element, kVectorSize> zeros;
+                zeros.clear();
+                *reinterpret_cast<cutlass::Array<Element, kVectorSize> *>(
+                    output_ptr + lane_idx * kVectorSize
+                    + vector * kWarpSize * kVectorSize) = zeros;
+            }
+            return;
+        }
+    }
+
+    const int split_offset = __ldg(params.num_splits_ptr + batch_idx);
+    const int actual_num_splits =
+        __ldg(params.num_splits_ptr + batch_idx + 1) - split_offset;
+    const int num_chunks = params.canonical_num_chunks;
+    FLASH_DEVICE_ASSERT(
+        actual_num_splits == num_chunks &&
+        (num_chunks == 2 || num_chunks == 4 || num_chunks == 8));
+
+    __shared__ float sLeftWeight[kRowsPerBlock][kMaxInternalNodes];
+    __shared__ float sRightWeight[kRowsPerBlock][kMaxInternalNodes];
+    __shared__ float sFinalLse[kRowsPerBlock];
+
+    const index_t row_offset_lseaccum = split_offset * hs + hs_idx;
+    const float *lseaccum_ptr =
+        reinterpret_cast<const float *>(params.softmax_lseaccum_ptr)
+        + row_offset_lseaccum;
+    if (lane_idx == 0) {
+        float tree_lse[2 * kMaxChunks - 1];
+        const int leaf_base = num_chunks - 1;
+#pragma unroll
+        for (int chunk = 0; chunk < kMaxChunks; ++chunk) {
+            if (chunk < num_chunks) {
+                tree_lse[leaf_base + chunk] =
+                    lseaccum_ptr[chunk * hs];
+            }
+        }
+        for (int node = leaf_base - 1; node >= 0; --node) {
+            tree_lse[node] = canonical_merge_lse(
+                tree_lse[2 * node + 1],
+                tree_lse[2 * node + 2],
+                sLeftWeight[warp_idx][node],
+                sRightWeight[warp_idx][node]);
+        }
+        sFinalLse[warp_idx] = tree_lse[0];
+        reinterpret_cast<float *>(params.softmax_lse_ptr)[
+            batch_idx * hs + hs_idx] = tree_lse[0];
+    }
+    __syncwarp();
+
+    const index_t row_offset_oaccum =
+        (split_offset * hs + hs_idx) * kHeadDimV;
+    const index_t split_stride = hs * kHeadDimV;
+    const float *oaccum_ptr =
+        reinterpret_cast<const float *>(params.oaccum_ptr)
+        + row_offset_oaccum;
+    constexpr int kVectorsPerThread =
+        kHeadDimV / (kWarpSize * kVectorSize);
+
+#pragma unroll
+    for (int vector = 0; vector < kVectorsPerThread; ++vector) {
+        const index_t element =
+            lane_idx * kVectorSize + vector * kWarpSize * kVectorSize;
+        auto load_chunk = [&](const int chunk) {
+            return *reinterpret_cast<const float4 *>(
+                oaccum_ptr + chunk * split_stride + element);
+        };
+        float4 result;
+        if (num_chunks == 2) {
+            result = canonical_merge_float4(
+                load_chunk(0), load_chunk(1),
+                sLeftWeight[warp_idx][0],
+                sRightWeight[warp_idx][0]);
+        } else if (num_chunks == 4) {
+            const float4 left = canonical_merge_float4(
+                load_chunk(0), load_chunk(1),
+                sLeftWeight[warp_idx][1],
+                sRightWeight[warp_idx][1]);
+            const float4 right = canonical_merge_float4(
+                load_chunk(2), load_chunk(3),
+                sLeftWeight[warp_idx][2],
+                sRightWeight[warp_idx][2]);
+            result = canonical_merge_float4(
+                left, right,
+                sLeftWeight[warp_idx][0],
+                sRightWeight[warp_idx][0]);
+        } else {
+            const float4 left01 = canonical_merge_float4(
+                load_chunk(0), load_chunk(1),
+                sLeftWeight[warp_idx][3],
+                sRightWeight[warp_idx][3]);
+            const float4 left23 = canonical_merge_float4(
+                load_chunk(2), load_chunk(3),
+                sLeftWeight[warp_idx][4],
+                sRightWeight[warp_idx][4]);
+            const float4 left = canonical_merge_float4(
+                left01, left23,
+                sLeftWeight[warp_idx][1],
+                sRightWeight[warp_idx][1]);
+            const float4 right45 = canonical_merge_float4(
+                load_chunk(4), load_chunk(5),
+                sLeftWeight[warp_idx][5],
+                sRightWeight[warp_idx][5]);
+            const float4 right67 = canonical_merge_float4(
+                load_chunk(6), load_chunk(7),
+                sLeftWeight[warp_idx][6],
+                sRightWeight[warp_idx][6]);
+            const float4 right = canonical_merge_float4(
+                right45, right67,
+                sLeftWeight[warp_idx][2],
+                sRightWeight[warp_idx][2]);
+            result = canonical_merge_float4(
+                left, right,
+                sLeftWeight[warp_idx][0],
+                sRightWeight[warp_idx][0]);
+        }
+
+        cutlass::Array<Element, kVectorSize> converted;
+        converted[0] = Element(result.x);
+        converted[1] = Element(result.y);
+        converted[2] = Element(result.z);
+        converted[3] = Element(result.w);
+        *reinterpret_cast<cutlass::Array<Element, kVectorSize> *>(
+            output_ptr + element) = converted;
+    }
 }
 
 } // namespace flash
@@ -747,19 +1182,113 @@ template<typename Kernel_traits, typename SharedStorage>
 void run_flash_splitkv_fwd_mla(DecodingParams_fp8 &params, cudaStream_t stream) {
     FLASH_ASSERT(params.page_block_size == Kernel_traits::kBlockN);
     const int num_m_block = cute::ceil_div(params.q_seq_per_hk, Kernel_traits::kBlockM);
+    constexpr int kSmallCombineRows = 512;
+    constexpr int kEightRowCombineRows = 1024;
+    const int rows_per_batch = params.h_k * params.q_seq_per_hk;
+    const int total_rows = params.b * rows_per_batch;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, SharedStorage>;
         constexpr size_t smem_size = sizeof(SharedStorage);
-        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        kernel<<<dim3(num_m_block, params.h_k, params.num_sm_parts), Kernel_traits::kNThreads, smem_size, stream>>>(params);
+        if (total_rows <= kSmallCombineRows &&
+            params.canonical_num_chunks == 0) {
+            auto kernel = &flash::flash_fwd_splitkv_mla_kernel<
+                Kernel_traits, Is_causal, SharedStorage, false>;
+            CHECK_CUDA(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            kernel<<<dim3(num_m_block, params.h_k, params.num_sm_parts),
+                     Kernel_traits::kNThreads, smem_size, stream>>>(params);
+        } else {
+            auto kernel = &flash::flash_fwd_splitkv_mla_kernel<
+                Kernel_traits, Is_causal, SharedStorage, true>;
+            CHECK_CUDA(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            cudaLaunchAttribute attributes[1];
+            attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attributes[0].val.programmaticStreamSerializationAllowed = 1;
+            cudaLaunchConfig_t config = {
+                dim3(num_m_block, params.h_k, params.num_sm_parts),
+                dim3(Kernel_traits::kNThreads, 1, 1),
+                smem_size,
+                stream,
+                attributes,
+                1
+            };
+            CHECK_CUDA(cudaLaunchKernelEx(&config, kernel, params));
+        }
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 
-    dim3 grid_combine(params.b * params.h_k * params.q_seq_per_hk);
+    if (params.canonical_return_leaves) {
+        return;
+    }
+
+    if (params.canonical_num_chunks > 0) {
+        auto launch_canonical_combine = [&](auto rows_per_block) {
+            constexpr int kRowsPerBlock = decltype(rows_per_block)::value;
+            const int combine_blocks_per_batch = cute::ceil_div(
+                rows_per_batch, kRowsPerBlock);
+            auto combine_kernel =
+                &flash::flash_fwd_splitkv_mla_canonical_combine_kernel<
+                    typename Kernel_traits::ElementO,
+                    typename Kernel_traits::index_t,
+                    Kernel_traits::kHeadDimV,
+                    kRowsPerBlock>;
+            cudaLaunchAttribute attributes[1];
+            attributes[0].id =
+                cudaLaunchAttributeProgrammaticStreamSerialization;
+            attributes[0].val.programmaticStreamSerializationAllowed = 1;
+            cudaLaunchConfig_t config = {
+                dim3(params.b * combine_blocks_per_batch, 1, 1),
+                dim3(kRowsPerBlock * 32, 1, 1),
+                0,
+                stream,
+                attributes,
+                1
+            };
+            CHECK_CUDA(cudaLaunchKernelEx(&config, combine_kernel, params));
+        };
+        if (total_rows == kEightRowCombineRows) {
+            launch_canonical_combine(cute::Int<8>{});
+        } else {
+            launch_canonical_combine(cute::Int<4>{});
+        }
+        CHECK_CUDA_KERNEL_LAUNCH();
+        return;
+    }
+
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, kMaxSplits, [&] {
-        auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel<
-                typename Kernel_traits::ElementO, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
-        combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
+        if (total_rows <= kSmallCombineRows) {
+            auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_128_kernel<
+                    typename Kernel_traits::ElementO, typename Kernel_traits::ElementAccum,
+                    typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
+            combine_kernel<<<total_rows, 128, 0, stream>>>(params);
+        } else {
+            auto launch_grouped_combine = [&](auto rows_per_block) {
+                constexpr int kRowsPerBlock = decltype(rows_per_block)::value;
+                const int combine_blocks_per_batch = cute::ceil_div(
+                    rows_per_batch, kRowsPerBlock);
+                auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_warp_grouped_kernel<
+                        typename Kernel_traits::ElementO, typename Kernel_traits::ElementAccum,
+                        typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits,
+                        kRowsPerBlock>;
+                cudaLaunchAttribute attributes[1];
+                attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+                attributes[0].val.programmaticStreamSerializationAllowed = 1;
+                cudaLaunchConfig_t config = {
+                    dim3(params.b * combine_blocks_per_batch, 1, 1),
+                    dim3(kRowsPerBlock * 32, 1, 1),
+                    0,
+                    stream,
+                    attributes,
+                    1
+                };
+                CHECK_CUDA(cudaLaunchKernelEx(&config, combine_kernel, params));
+            };
+            if (total_rows == kEightRowCombineRows) {
+                launch_grouped_combine(cute::Int<8>{});
+            } else {
+                launch_grouped_combine(cute::Int<4>{});
+            }
+        }
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 }

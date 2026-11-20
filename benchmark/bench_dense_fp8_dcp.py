@@ -155,7 +155,8 @@ def benchmark(args):
 
     print(
         f"GPU={torch.cuda.get_device_name()} B={args.batch} "
-        f"Q={args.q_len} H={args.num_heads} KV={args.kv_len}"
+        f"Q={args.q_len} H={args.num_heads} KV={args.kv_len} "
+        f"local_out={args.local_output_dtype}"
     )
     print(
         "cp  rank_ms                         critical_ms  "
@@ -177,7 +178,12 @@ def benchmark(args):
 
         def run_rank(rank: int):
             inputs = ranks[rank]
-            return flash_mla.flash_mla_dense_fp8(
+            attention_fn = (
+                flash_mla.flash_mla_dense_fp8_fp32
+                if args.local_output_dtype == "fp32"
+                else flash_mla.flash_mla_dense_fp8
+            )
+            return attention_fn(
                 q,
                 inputs.cache,
                 inputs.block_table,
@@ -244,6 +250,11 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--local-output-dtype",
+        choices=("bf16", "fp32"),
+        default="bf16",
+    )
     args = parser.parse_args()
     args.cp_sizes = sorted(
         {int(value) for value in args.cp_sizes.split(",")}
